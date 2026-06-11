@@ -16,27 +16,28 @@ type ContextRecord = {
   updatedAt: string;
 };
 
-type ExtractedSections = {
-  summary: string[];
-  decisions: string[];
-  owners: string[];
-  datesMilestones: string[];
-  blockers: string[];
-  risks: string[];
-  dependencies: string[];
-  requirements: string[];
-  actionItems: string[];
-  openQuestions: string[];
-  urlsIds: string[];
-  otherImportant: string[];
-};
+type SectionName =
+  | "summary"
+  | "decisions"
+  | "owners"
+  | "datesMilestones"
+  | "blockers"
+  | "risks"
+  | "dependencies"
+  | "requirements"
+  | "actionItems"
+  | "openQuestions"
+  | "urlsIds"
+  | "other";
+
+type Sections = Record<SectionName, string[]>;
 
 const store = new Map<string, ContextRecord>();
 
 const server = new MCPServer({
   name: "token-compressor-mcp",
   title: "Token Compressor MCP",
-  version: "0.3.0",
+  version: "0.4.0",
   description:
     "Compress, save, retrieve, and delete compact context records for Claude/Cowork. Use for non-sensitive long notes, transcripts, project background, and reusable context.",
   stateless: false,
@@ -55,39 +56,60 @@ function makeId(): string {
 function normalizeWhitespace(input: string): string {
   return input
     .replace(/\r\n/g, "\n")
-    .replace(/[\t ]+/g, " ")
+    .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
 function splitSentences(input: string): string[] {
   return normalizeWhitespace(input)
+    .replace(/\n+/g, " ")
     .split(/(?<=[.!?])\s+(?=[A-Z0-9])/g)
     .map((sentence) => sentence.trim())
-    .filter(Boolean);
+    .filter((sentence) => sentence.length >= 25);
 }
 
-function unique(items: string[]): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
+function normalizeForCompare(input: string): string {
+  return input
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  for (const item of items) {
-    const cleaned = item
-      .replace(/^[-*•]\s+/, "")
-      .replace(/^\d+[.)]\s+/, "")
-      .replace(/\s+/g, " ")
-      .trim();
+function wordSet(input: string): Set<string> {
+  return new Set(
+    normalizeForCompare(input)
+      .split(" ")
+      .filter((word) => word.length > 3),
+  );
+}
 
-    if (!cleaned) continue;
+function overlapRatio(a: string, b: string): number {
+  const aWords = wordSet(a);
+  const bWords = wordSet(b);
 
-    const key = cleaned.toLowerCase();
-    if (seen.has(key)) continue;
+  if (aWords.size === 0 || bWords.size === 0) return 0;
 
-    seen.add(key);
-    result.push(cleaned);
+  let shared = 0;
+  for (const word of aWords) {
+    if (bWords.has(word)) shared += 1;
   }
 
-  return result;
+  return shared / Math.min(aWords.size, bWords.size);
+}
+
+function addUnique(target: string[], candidate: string): void {
+  const cleaned = candidate.replace(/^[-*•]\s+/, "").replace(/^\d+[.)]\s+/, "").trim();
+  if (!cleaned) return;
+
+  for (const existing of target) {
+    if (normalizeForCompare(existing) === normalizeForCompare(cleaned)) return;
+    if (overlapRatio(existing, cleaned) >= 0.82) return;
+  }
+
+  target.push(cleaned);
 }
 
 function includesAny(value: string, terms: string[]): boolean {
@@ -110,69 +132,95 @@ function extractUrlsAndIds(input: string): string[] {
     ...input.matchAll(/\b[A-Z]{2,}-[A-Z0-9-]{3,}\b/g),
   ].map((match) => match[0]);
 
-  return unique(matches);
+  const result: string[] = [];
+  for (const match of matches) addUnique(result, match);
+  return result;
+}
+
+function classifySentence(sentence: string): SectionName {
+  const lower = sentence.toLowerCase();
+
+  if (
+    includesAny(lower, ["open question", "not decided", "no final answer", "needs a decision", "needs guidance"])
+    || sentence.endsWith("?")
+  ) {
+    return "openQuestions";
+  }
+
+  if (
+    includesAny(lower, ["action item", "next step"])
+    || (
+      /\b[A-Z][a-z]+(\s[A-Z][a-z]+)?\s+will\b/.test(sentence)
+      && (hasDate(sentence) || lower.includes(" by "))
+    )
+  ) {
+    return "actionItems";
+  }
+
+  if (
+    /\b[A-Z][a-z]+(\s[A-Z][a-z]+)?\s+owns\b/.test(sentence)
+    || includesAny(lower, ["project sponsor", "program lead", "owner is", "owner:", "responsible for", "accountable for"])
+  ) {
+    return "owners";
+  }
+
+  if (
+    includesAny(lower, ["decision", "decided", "approved", "final call", "chosen", "agreed to"])
+  ) {
+    return "decisions";
+  }
+
+  if (
+    includesAny(lower, ["primary blocker", "main blocker", "blocker", "blocked", "blocking"])
+  ) {
+    return "blockers";
+  }
+
+  if (
+    includesAny(lower, ["risk", "concern", "could affect", "could create", "may cause", "disruption"])
+  ) {
+    return "risks";
+  }
+
+  if (
+    includesAny(lower, ["depends on", "dependency", "dependent on"])
+  ) {
+    return "dependencies";
+  }
+
+  if (
+    includesAny(lower, ["requirement", "must", "success criteria", "criteria are", "target is", "target launch"])
+  ) {
+    return "requirements";
+  }
+
+  if (
+    hasDate(sentence)
+    || includesAny(lower, ["launch date", "deadline", "milestone", "go/no-go", "backup date"])
+  ) {
+    return "datesMilestones";
+  }
+
+  return "other";
 }
 
 function scoreSentence(sentence: string): number {
   const lower = sentence.toLowerCase();
   let score = 0;
 
-  const highValueTerms = [
-    "decision",
-    "decided",
-    "approved",
-    "owner",
-    "owns",
-    "sponsor",
-    "lead",
-    "due",
-    "deadline",
-    "risk",
-    "blocker",
-    "blocked",
-    "dependency",
-    "depends on",
-    "next step",
-    "action",
-    "todo",
-    "requirement",
-    "must",
-    "should",
-    "approval",
-    "launch",
-    "date",
-    "milestone",
-    "open question",
-    "issue",
-    "constraint",
-    "success criteria",
-    "metric",
-    "scope",
-    "status",
-    "timeline",
-  ];
-
-  for (const term of highValueTerms) {
-    if (lower.includes(term)) score += 3;
-  }
-
+  if (includesAny(lower, ["decision", "approved", "blocker", "risk", "dependency", "owner", "owns"])) score += 4;
+  if (includesAny(lower, ["action", "next step", "open question", "success criteria", "requirement"])) score += 4;
+  if (hasDate(sentence)) score += 3;
   if (/\b[A-Z][a-z]+\s[A-Z][a-z]+\b/.test(sentence)) score += 2;
-  if (hasDate(sentence)) score += 2;
   if (/https?:\/\//.test(sentence)) score += 2;
-  if (/\b[A-Z]+-\d+\b/.test(sentence)) score += 2;
-  if (sentence.length > 40 && sentence.length < 260) score += 1;
-  if (sentence.length > 300) score -= 1;
+  if (sentence.length >= 50 && sentence.length <= 220) score += 1;
+  if (sentence.length > 280) score -= 2;
 
   return score;
 }
 
-function extractSections(rawText: string): ExtractedSections {
-  const cleaned = normalizeWhitespace(rawText);
-  const lines = cleaned.split("\n").map((line) => line.trim()).filter(Boolean);
-  const sentences = splitSentences(cleaned);
-  const allUnits = unique([...lines, ...sentences]);
-
-  const sections: ExtractedSections = {
+function extractSections(rawText: string): Sections {
+  const sections: Sections = {
     summary: [],
     decisions: [],
     owners: [],
@@ -183,106 +231,166 @@ function extractSections(rawText: string): ExtractedSections {
     requirements: [],
     actionItems: [],
     openQuestions: [],
-    urlsIds: extractUrlsAndIds(cleaned),
-    otherImportant: [],
+    urlsIds: extractUrlsAndIds(rawText),
+    other: [],
   };
 
-  for (const unit of allUnits) {
-    const lower = unit.toLowerCase();
+  const sentences = splitSentences(rawText);
 
-    if (
-      includesAny(lower, ["decision", "decided", "approved", "final call", "chosen", "agreed to", "will use", "approach will"])
-    ) {
-      sections.decisions.push(unit);
-    }
-
-    if (
-      /\b[A-Z][a-z]+(\s[A-Z][a-z]+)?\s+owns\b/.test(unit)
-      || includesAny(lower, ["project sponsor", "program lead", "owns ", "owner is", "owner:", "responsible for", "accountable for"])
-    ) {
-      sections.owners.push(unit);
-    }
-
-    if (
-      hasDate(unit)
-      || includesAny(lower, ["target launch", "launch date", "deadline", "milestone", "go/no-go", "readiness checklist", "backup date"])
-    ) {
-      sections.datesMilestones.push(unit);
-    }
-
-    if (
-      includesAny(lower, ["blocker", "blocked", "blocking", "primary blocker", "main blocker", "cannot", "unable to"])
-    ) {
-      sections.blockers.push(unit);
-    }
-
-    if (
-      includesAny(lower, ["risk", "concern", "could affect", "could create", "may cause", "mitigation", "disruption"])
-    ) {
-      sections.risks.push(unit);
-    }
-
-    if (
-      includesAny(lower, ["depends on", "dependency", "dependent on", "requires", "requires vendor", "requires identity"])
-    ) {
-      sections.dependencies.push(unit);
-    }
-
-    if (
-      includesAny(lower, ["requirement", "must", "should", "success criteria", "target", "criteria", "metric", "readiness"])
-    ) {
-      sections.requirements.push(unit);
-    }
-
-    if (
-      includesAny(lower, ["action item", "next step", "will ", " to draft ", " to send ", " to confirm ", " to complete ", " to run ", " to publish ", " to prepare "])
-      && (hasDate(unit) || includesAny(lower, ["by ", "next step", "action item"]))
-    ) {
-      sections.actionItems.push(unit);
-    }
-
-    if (
-      includesAny(lower, ["open question", "not decided", "no final answer", "needs a decision", "needs guidance", "whether "])
-      || unit.endsWith("?")
-    ) {
-      sections.openQuestions.push(unit);
-    }
+  for (const sentence of sentences) {
+    const section = classifySentence(sentence);
+    addUnique(sections[section], sentence);
   }
 
-  const important = sentences
+  const summaryCandidates = sentences
+    .filter((sentence) => sentence.length >= 60 && sentence.length <= 240)
+    .slice(0, 4);
+
+  for (const sentence of summaryCandidates) addUnique(sections.summary, sentence);
+
+  const importantOther = sentences
+    .filter((sentence) => classifySentence(sentence) === "other")
     .map((sentence) => ({ sentence, score: scoreSentence(sentence) }))
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score)
     .map((item) => item.sentence);
 
-  sections.otherImportant = unique(important).slice(0, 20);
-
-  const firstSentences = sentences
-    .filter((sentence) => sentence.length > 60 && sentence.length < 260)
-    .slice(0, 4);
-
-  sections.summary = unique(firstSentences);
-
-  for (const key of Object.keys(sections) as Array<keyof ExtractedSections>) {
-    sections[key] = unique(sections[key]);
-  }
+  sections.other = [];
+  for (const sentence of importantOther) addUnique(sections.other, sentence);
 
   return sections;
 }
 
-function bulletize(items: string[], maxItems?: number): string {
-  const selected = typeof maxItems === "number" ? items.slice(0, maxItems) : items;
+function sectionLimit(mode: CompressionMode, sectionName: SectionName): number {
+  if (mode === "brief") {
+    const limits: Record<SectionName, number> = {
+      summary: 3,
+      decisions: 4,
+      owners: 4,
+      datesMilestones: 4,
+      blockers: 4,
+      risks: 4,
+      dependencies: 3,
+      requirements: 4,
+      actionItems: 5,
+      openQuestions: 4,
+      urlsIds: 6,
+      other: 3,
+    };
+    return limits[sectionName];
+  }
+
+  if (mode === "balanced") {
+    const limits: Record<SectionName, number> = {
+      summary: 4,
+      decisions: 6,
+      owners: 8,
+      datesMilestones: 6,
+      blockers: 6,
+      risks: 6,
+      dependencies: 5,
+      requirements: 6,
+      actionItems: 8,
+      openQuestions: 6,
+      urlsIds: 8,
+      other: 5,
+    };
+    return limits[sectionName];
+  }
+
+  if (mode === "lossless_facts") {
+    return 50;
+  }
+
+  const structuredLimits: Record<SectionName, number> = {
+    summary: 4,
+    decisions: 8,
+    owners: 12,
+    datesMilestones: 8,
+    blockers: 8,
+    risks: 8,
+    dependencies: 6,
+    requirements: 8,
+    actionItems: 12,
+    openQuestions: 8,
+    urlsIds: 12,
+    other: 4,
+  };
+
+  return structuredLimits[sectionName];
+}
+
+function bulletize(items: string[], maxItems: number): string {
+  const selected = items.slice(0, maxItems);
   if (selected.length === 0) return "• None detected.";
   return selected.map((item) => `• ${item}`).join("\n");
 }
 
-function section(title: string, items: string[], maxItems?: number): string {
+function renderSection(title: string, items: string[], maxItems: number): string {
   return [`## ${title}`, bulletize(items, maxItems)].join("\n");
 }
 
-function buildStructuredOutput(rawText: string, targetTokens: number, mode: CompressionMode): string {
+function buildOutput(sections: Sections, mode: CompressionMode, targetTokens: number): string {
+  const orderedSections: Array<[string, SectionName]> = [
+    ["Summary", "summary"],
+    ["Decisions", "decisions"],
+    ["Owners", "owners"],
+    ["Dates / Milestones", "datesMilestones"],
+    ["Blockers", "blockers"],
+    ["Risks", "risks"],
+    ["Dependencies", "dependencies"],
+    ["Requirements / Success Criteria", "requirements"],
+    ["Action Items", "actionItems"],
+    ["Open Questions", "openQuestions"],
+    ["URLs / IDs", "urlsIds"],
+    ["Other Important Context", "other"],
+  ];
+
+  const warnings: string[] = [];
+
+  const render = (includeOther: boolean, shrink: boolean): string => {
+    const parts = ["Compressed context:"];
+
+    for (const [title, key] of orderedSections) {
+      if (!includeOther && key === "other") continue;
+      const baseLimit = sectionLimit(mode, key);
+      const limit = shrink ? Math.max(2, Math.ceil(baseLimit / 2)) : baseLimit;
+      parts.push("", renderSection(title, sections[key], limit));
+    }
+
+    if (warnings.length > 0) {
+      parts.push("", "## Fidelity Warnings", bulletize(warnings, 10));
+    }
+
+    parts.push(
+      "",
+      "## Use Guidance",
+      "• Use this compact context instead of the raw source unless exact wording is required.",
+      "• Verify protected facts against the source before final decisions.",
+    );
+
+    return parts.join("\n");
+  };
+
+  let output = render(mode !== "brief" && mode !== "lossless_facts", false);
+
+  if (mode === "lossless_facts") return output;
+
+  if (estimateTokens(output) <= targetTokens) return output;
+
+  warnings.push(`Output exceeded target of ${targetTokens} tokens; non-critical context was trimmed first.`);
+  output = render(false, false);
+
+  if (estimateTokens(output) <= targetTokens) return output;
+
+  warnings.push("Protected sections were reduced to fit the target token budget.");
+  output = render(false, true);
+
+  return output;
+}
+
+function compressText(rawText: string, targetTokens = 1200, mode: CompressionMode = "structured"): string {
   const rawTokens = estimateTokens(rawText);
-  const extracted = extractSections(rawText);
 
   if (rawTokens < 150) {
     return [
@@ -296,124 +404,8 @@ function buildStructuredOutput(rawText: string, targetTokens: number, mode: Comp
     ].join("\n");
   }
 
-  const warnings: string[] = [];
-
-  if (rawText.toLowerCase().includes("owner") && extracted.owners.length === 0) {
-    warnings.push("Owner-related language was detected, but no owner mappings were confidently extracted.");
-  }
-
-  if (
-    includesAny(rawText.toLowerCase(), ["action", "next step", "will "])
-    && extracted.actionItems.length === 0
-  ) {
-    warnings.push("Action-related language was detected, but no action items were confidently extracted.");
-  }
-
-  if (
-    includesAny(rawText.toLowerCase(), ["open question", "not decided", "whether"])
-    && extracted.openQuestions.length === 0
-  ) {
-    warnings.push("Open-question language was detected, but no open questions were confidently extracted.");
-  }
-
-  const isBrief = mode === "brief";
-  const isBalanced = mode === "balanced";
-  const isLosslessFacts = mode === "lossless_facts";
-
-  const maxSummary = isBrief ? 3 : 5;
-  const maxOther = isBrief ? 6 : isBalanced ? 10 : 14;
-  const protectedMax = isBrief ? 8 : undefined;
-
-  const parts = [
-    "Compressed context:",
-    "",
-    section("Summary", extracted.summary, maxSummary),
-    "",
-    section("Decisions", extracted.decisions, protectedMax),
-    "",
-    section("Owners", extracted.owners, protectedMax),
-    "",
-    section("Dates / Milestones", extracted.datesMilestones, protectedMax),
-    "",
-    section("Blockers", extracted.blockers, protectedMax),
-    "",
-    section("Risks", extracted.risks, protectedMax),
-    "",
-    section("Dependencies", extracted.dependencies, protectedMax),
-    "",
-    section("Requirements / Success Criteria", extracted.requirements, protectedMax),
-    "",
-    section("Action Items", extracted.actionItems, protectedMax),
-    "",
-    section("Open Questions", extracted.openQuestions, protectedMax),
-    "",
-    section("URLs / IDs", extracted.urlsIds, protectedMax),
-  ];
-
-  if (!isLosslessFacts) {
-    parts.push("", section("Other Important Context", extracted.otherImportant, maxOther));
-  }
-
-  if (warnings.length > 0) {
-    parts.push("", "## Fidelity Warnings", bulletize(warnings));
-  }
-
-  parts.push(
-    "",
-    "## Use Guidance",
-    "• Use this compact context instead of the raw source unless exact wording is required.",
-    "• Verify protected facts against the source before making final decisions.",
-    "• Prefer a lower compression ratio over dropping owners, dates, decisions, risks, blockers, action items, IDs, or links.",
-  );
-
-  let output = parts.join("\n");
-
-  if (estimateTokens(output) <= targetTokens || isLosslessFacts) {
-    return output;
-  }
-
-  const reduced = [
-    "Compressed context:",
-    "",
-    section("Summary", extracted.summary, maxSummary),
-    "",
-    section("Decisions", extracted.decisions, protectedMax),
-    "",
-    section("Owners", extracted.owners, protectedMax),
-    "",
-    section("Dates / Milestones", extracted.datesMilestones, protectedMax),
-    "",
-    section("Blockers", extracted.blockers, protectedMax),
-    "",
-    section("Risks", extracted.risks, protectedMax),
-    "",
-    section("Dependencies", extracted.dependencies, protectedMax),
-    "",
-    section("Requirements / Success Criteria", extracted.requirements, protectedMax),
-    "",
-    section("Action Items", extracted.actionItems, protectedMax),
-    "",
-    section("Open Questions", extracted.openQuestions, protectedMax),
-    "",
-    section("URLs / IDs", extracted.urlsIds, protectedMax),
-  ];
-
-  if (warnings.length > 0) {
-    reduced.push("", "## Fidelity Warnings", bulletize(warnings));
-  }
-
-  reduced.push(
-    "",
-    "## Compression Note",
-    `• Output exceeded the requested target of ${targetTokens} tokens, so narrative context was removed before protected facts.`,
-  );
-
-  output = reduced.join("\n");
-  return output;
-}
-
-function compressText(rawText: string, targetTokens = 1200, mode: CompressionMode = "structured"): string {
-  return buildStructuredOutput(rawText, targetTokens, mode);
+  const sections = extractSections(rawText);
+  return buildOutput(sections, mode, targetTokens);
 }
 
 function recordToText(record: ContextRecord): string {
@@ -593,7 +585,7 @@ server.tool(
     }),
   },
   async ({ confirm }) => {
-    if (!confirm) return text("Clear cancelled. Set confirm=true to delete all saved contexts.");
+    if (!confirm) return text("Clear cancelled. Set confirm=true to delete all contexts.");
     const count = store.size;
     store.clear();
     return text(`Deleted ${count} saved contexts.`);
