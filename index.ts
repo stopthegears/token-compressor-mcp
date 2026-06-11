@@ -37,7 +37,7 @@ const store = new Map<string, ContextRecord>();
 const server = new MCPServer({
   name: "token-compressor-mcp",
   title: "Token Compressor MCP",
-  version: "0.4.0",
+  version: "0.5.0",
   description:
     "Compress, save, retrieve, and delete compact context records for Claude/Cowork. Use for non-sensitive long notes, transcripts, project background, and reusable context.",
   stateless: false,
@@ -261,7 +261,30 @@ function extractSections(rawText: string): Sections {
   return sections;
 }
 
-function sectionLimit(mode: CompressionMode, sectionName: SectionName): number {
+function isProtectedSection(sectionName: SectionName): boolean {
+  return [
+    "decisions",
+    "owners",
+    "datesMilestones",
+    "blockers",
+    "risks",
+    "dependencies",
+    "requirements",
+    "actionItems",
+    "openQuestions",
+    "urlsIds",
+  ].includes(sectionName);
+}
+
+function sectionLimit(mode: CompressionMode, sectionName: SectionName, itemCount: number): number {
+  if (mode === "lossless_facts") {
+    return itemCount;
+  }
+
+  if (mode === "structured" && isProtectedSection(sectionName)) {
+    return itemCount;
+  }
+
   if (mode === "brief") {
     const limits: Record<SectionName, number> = {
       summary: 3,
@@ -277,7 +300,7 @@ function sectionLimit(mode: CompressionMode, sectionName: SectionName): number {
       urlsIds: 6,
       other: 3,
     };
-    return limits[sectionName];
+    return Math.min(itemCount, limits[sectionName]);
   }
 
   if (mode === "balanced") {
@@ -295,29 +318,25 @@ function sectionLimit(mode: CompressionMode, sectionName: SectionName): number {
       urlsIds: 8,
       other: 5,
     };
-    return limits[sectionName];
+    return Math.min(itemCount, limits[sectionName]);
   }
 
-  if (mode === "lossless_facts") {
-    return 50;
-  }
-
-  const structuredLimits: Record<SectionName, number> = {
+  const structuredNarrativeLimits: Record<SectionName, number> = {
     summary: 4,
-    decisions: 8,
-    owners: 12,
-    datesMilestones: 8,
-    blockers: 8,
-    risks: 8,
-    dependencies: 6,
-    requirements: 8,
-    actionItems: 12,
-    openQuestions: 8,
-    urlsIds: 12,
+    decisions: itemCount,
+    owners: itemCount,
+    datesMilestones: itemCount,
+    blockers: itemCount,
+    risks: itemCount,
+    dependencies: itemCount,
+    requirements: itemCount,
+    actionItems: itemCount,
+    openQuestions: itemCount,
+    urlsIds: itemCount,
     other: 4,
   };
 
-  return structuredLimits[sectionName];
+  return Math.min(itemCount, structuredNarrativeLimits[sectionName]);
 }
 
 function bulletize(items: string[], maxItems: number): string {
@@ -348,13 +367,20 @@ function buildOutput(sections: Sections, mode: CompressionMode, targetTokens: nu
 
   const warnings: string[] = [];
 
-  const render = (includeOther: boolean, shrink: boolean): string => {
+  const render = (includeOther: boolean, shrinkNarrative: boolean): string => {
     const parts = ["Compressed context:"];
 
     for (const [title, key] of orderedSections) {
       if (!includeOther && key === "other") continue;
-      const baseLimit = sectionLimit(mode, key);
-      const limit = shrink ? Math.max(2, Math.ceil(baseLimit / 2)) : baseLimit;
+
+      const itemCount = sections[key].length;
+      const baseLimit = sectionLimit(mode, key, itemCount);
+
+      let limit = baseLimit;
+      if (shrinkNarrative && !isProtectedSection(key)) {
+        limit = Math.max(1, Math.ceil(baseLimit / 2));
+      }
+
       parts.push("", renderSection(title, sections[key], limit));
     }
 
@@ -382,6 +408,11 @@ function buildOutput(sections: Sections, mode: CompressionMode, targetTokens: nu
   output = render(false, false);
 
   if (estimateTokens(output) <= targetTokens) return output;
+
+  if (mode === "structured") {
+    warnings.push("Protected facts were preserved even though the output exceeded the requested target.");
+    return output;
+  }
 
   warnings.push("Protected sections were reduced to fit the target token budget.");
   output = render(false, true);
