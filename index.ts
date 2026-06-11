@@ -1,6 +1,8 @@
 import { MCPServer, text } from "mcp-use/server";
 import { z } from "zod";
 
+type CompressionMode = "brief" | "balanced" | "structured" | "lossless_facts";
+
 type ContextRecord = {
   id: string;
   title: string;
@@ -14,12 +16,27 @@ type ContextRecord = {
   updatedAt: string;
 };
 
+type ExtractedSections = {
+  summary: string[];
+  decisions: string[];
+  owners: string[];
+  datesMilestones: string[];
+  blockers: string[];
+  risks: string[];
+  dependencies: string[];
+  requirements: string[];
+  actionItems: string[];
+  openQuestions: string[];
+  urlsIds: string[];
+  otherImportant: string[];
+};
+
 const store = new Map<string, ContextRecord>();
 
 const server = new MCPServer({
   name: "token-compressor-mcp",
   title: "Token Compressor MCP",
-  version: "0.2.0",
+  version: "0.3.0",
   description:
     "Compress, save, retrieve, and delete compact context records for Claude/Cowork. Use for non-sensitive long notes, transcripts, project background, and reusable context.",
   stateless: false,
@@ -50,6 +67,52 @@ function splitSentences(input: string): string[] {
     .filter(Boolean);
 }
 
+function unique(items: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const item of items) {
+    const cleaned = item
+      .replace(/^[-*•]\s+/, "")
+      .replace(/^\d+[.)]\s+/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!cleaned) continue;
+
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    result.push(cleaned);
+  }
+
+  return result;
+}
+
+function includesAny(value: string, terms: string[]): boolean {
+  const lower = value.toLowerCase();
+  return terms.some((term) => lower.includes(term));
+}
+
+function hasDate(value: string): boolean {
+  return /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}\b/i.test(value)
+    || /\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b/.test(value)
+    || /\b\d{4}-\d{2}-\d{2}\b/.test(value)
+    || /\bby\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(value)
+    || /\bby\s+(today|tomorrow|eod|end of week|next week)\b/i.test(value);
+}
+
+function extractUrlsAndIds(input: string): string[] {
+  const matches = [
+    ...input.matchAll(/https?:\/\/[^\s)]+/g),
+    ...input.matchAll(/\b[A-Z][A-Z0-9]+-\d+\b/g),
+    ...input.matchAll(/\b[A-Z]{2,}-[A-Z0-9-]{3,}\b/g),
+  ].map((match) => match[0]);
+
+  return unique(matches);
+}
+
 function scoreSentence(sentence: string): number {
   const lower = sentence.toLowerCase();
   let score = 0;
@@ -57,12 +120,18 @@ function scoreSentence(sentence: string): number {
   const highValueTerms = [
     "decision",
     "decided",
+    "approved",
     "owner",
+    "owns",
+    "sponsor",
+    "lead",
     "due",
     "deadline",
     "risk",
     "blocker",
+    "blocked",
     "dependency",
+    "depends on",
     "next step",
     "action",
     "todo",
@@ -88,7 +157,7 @@ function scoreSentence(sentence: string): number {
   }
 
   if (/\b[A-Z][a-z]+\s[A-Z][a-z]+\b/.test(sentence)) score += 2;
-  if (/\b\d{1,2}[/-]\d{1,2}([/-]\d{2,4})?\b|\b\d{4}-\d{2}-\d{2}\b/.test(sentence)) score += 2;
+  if (hasDate(sentence)) score += 2;
   if (/https?:\/\//.test(sentence)) score += 2;
   if (/\b[A-Z]+-\d+\b/.test(sentence)) score += 2;
   if (sentence.length > 40 && sentence.length < 260) score += 1;
@@ -97,52 +166,254 @@ function scoreSentence(sentence: string): number {
   return score;
 }
 
-function bulletize(lines: string[]): string {
-  const unique = Array.from(
-    new Set(lines.map((line) => line.trim()).filter(Boolean)),
-  );
-  return unique.map((line) => `• ${line}`).join("\n");
-}
-
-function compressText(rawText: string, targetTokens = 1200): string {
+function extractSections(rawText: string): ExtractedSections {
   const cleaned = normalizeWhitespace(rawText);
-  if (!cleaned) return "";
-
   const lines = cleaned.split("\n").map((line) => line.trim()).filter(Boolean);
-  const explicitBullets = lines.filter((line) => /^[-*•]\s+|^\d+[.)]\s+/.test(line));
   const sentences = splitSentences(cleaned);
+  const allUnits = unique([...lines, ...sentences]);
 
-  const highValueSentences = sentences
+  const sections: ExtractedSections = {
+    summary: [],
+    decisions: [],
+    owners: [],
+    datesMilestones: [],
+    blockers: [],
+    risks: [],
+    dependencies: [],
+    requirements: [],
+    actionItems: [],
+    openQuestions: [],
+    urlsIds: extractUrlsAndIds(cleaned),
+    otherImportant: [],
+  };
+
+  for (const unit of allUnits) {
+    const lower = unit.toLowerCase();
+
+    if (
+      includesAny(lower, ["decision", "decided", "approved", "final call", "chosen", "agreed to", "will use", "approach will"])
+    ) {
+      sections.decisions.push(unit);
+    }
+
+    if (
+      /\b[A-Z][a-z]+(\s[A-Z][a-z]+)?\s+owns\b/.test(unit)
+      || includesAny(lower, ["project sponsor", "program lead", "owns ", "owner is", "owner:", "responsible for", "accountable for"])
+    ) {
+      sections.owners.push(unit);
+    }
+
+    if (
+      hasDate(unit)
+      || includesAny(lower, ["target launch", "launch date", "deadline", "milestone", "go/no-go", "readiness checklist", "backup date"])
+    ) {
+      sections.datesMilestones.push(unit);
+    }
+
+    if (
+      includesAny(lower, ["blocker", "blocked", "blocking", "primary blocker", "main blocker", "cannot", "unable to"])
+    ) {
+      sections.blockers.push(unit);
+    }
+
+    if (
+      includesAny(lower, ["risk", "concern", "could affect", "could create", "may cause", "mitigation", "disruption"])
+    ) {
+      sections.risks.push(unit);
+    }
+
+    if (
+      includesAny(lower, ["depends on", "dependency", "dependent on", "requires", "requires vendor", "requires identity"])
+    ) {
+      sections.dependencies.push(unit);
+    }
+
+    if (
+      includesAny(lower, ["requirement", "must", "should", "success criteria", "target", "criteria", "metric", "readiness"])
+    ) {
+      sections.requirements.push(unit);
+    }
+
+    if (
+      includesAny(lower, ["action item", "next step", "will ", " to draft ", " to send ", " to confirm ", " to complete ", " to run ", " to publish ", " to prepare "])
+      && (hasDate(unit) || includesAny(lower, ["by ", "next step", "action item"]))
+    ) {
+      sections.actionItems.push(unit);
+    }
+
+    if (
+      includesAny(lower, ["open question", "not decided", "no final answer", "needs a decision", "needs guidance", "whether "])
+      || unit.endsWith("?")
+    ) {
+      sections.openQuestions.push(unit);
+    }
+  }
+
+  const important = sentences
     .map((sentence) => ({ sentence, score: scoreSentence(sentence) }))
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score)
     .map((item) => item.sentence);
 
-  const selected: string[] = [];
+  sections.otherImportant = unique(important).slice(0, 20);
 
-  for (const line of explicitBullets.slice(0, 30)) {
-    selected.push(line.replace(/^[-*•]\s+/, "").replace(/^\d+[.)]\s+/, ""));
+  const firstSentences = sentences
+    .filter((sentence) => sentence.length > 60 && sentence.length < 260)
+    .slice(0, 4);
+
+  sections.summary = unique(firstSentences);
+
+  for (const key of Object.keys(sections) as Array<keyof ExtractedSections>) {
+    sections[key] = unique(sections[key]);
   }
 
-  for (const sentence of highValueSentences) {
-    selected.push(sentence);
-    if (estimateTokens(bulletize(selected)) >= targetTokens) break;
+  return sections;
+}
+
+function bulletize(items: string[], maxItems?: number): string {
+  const selected = typeof maxItems === "number" ? items.slice(0, maxItems) : items;
+  if (selected.length === 0) return "• None detected.";
+  return selected.map((item) => `• ${item}`).join("\n");
+}
+
+function section(title: string, items: string[], maxItems?: number): string {
+  return [`## ${title}`, bulletize(items, maxItems)].join("\n");
+}
+
+function buildStructuredOutput(rawText: string, targetTokens: number, mode: CompressionMode): string {
+  const rawTokens = estimateTokens(rawText);
+  const extracted = extractSections(rawText);
+
+  if (rawTokens < 150) {
+    return [
+      "Input is already short.",
+      "",
+      `Raw token estimate: ${rawTokens}`,
+      "Compression threshold: 150 tokens",
+      "",
+      "Recommendation:",
+      "• Use the text as-is unless you need to store it for later retrieval.",
+    ].join("\n");
   }
 
-  if (selected.length < 5) {
-    for (const sentence of sentences.slice(0, 14)) selected.push(sentence);
+  const warnings: string[] = [];
+
+  if (rawText.toLowerCase().includes("owner") && extracted.owners.length === 0) {
+    warnings.push("Owner-related language was detected, but no owner mappings were confidently extracted.");
   }
 
-  const compressed = bulletize(selected);
+  if (
+    includesAny(rawText.toLowerCase(), ["action", "next step", "will "])
+    && extracted.actionItems.length === 0
+  ) {
+    warnings.push("Action-related language was detected, but no action items were confidently extracted.");
+  }
 
-  return [
+  if (
+    includesAny(rawText.toLowerCase(), ["open question", "not decided", "whether"])
+    && extracted.openQuestions.length === 0
+  ) {
+    warnings.push("Open-question language was detected, but no open questions were confidently extracted.");
+  }
+
+  const isBrief = mode === "brief";
+  const isBalanced = mode === "balanced";
+  const isLosslessFacts = mode === "lossless_facts";
+
+  const maxSummary = isBrief ? 3 : 5;
+  const maxOther = isBrief ? 6 : isBalanced ? 10 : 14;
+  const protectedMax = isBrief ? 8 : undefined;
+
+  const parts = [
     "Compressed context:",
-    compressed,
     "",
-    "Use guidance:",
+    section("Summary", extracted.summary, maxSummary),
+    "",
+    section("Decisions", extracted.decisions, protectedMax),
+    "",
+    section("Owners", extracted.owners, protectedMax),
+    "",
+    section("Dates / Milestones", extracted.datesMilestones, protectedMax),
+    "",
+    section("Blockers", extracted.blockers, protectedMax),
+    "",
+    section("Risks", extracted.risks, protectedMax),
+    "",
+    section("Dependencies", extracted.dependencies, protectedMax),
+    "",
+    section("Requirements / Success Criteria", extracted.requirements, protectedMax),
+    "",
+    section("Action Items", extracted.actionItems, protectedMax),
+    "",
+    section("Open Questions", extracted.openQuestions, protectedMax),
+    "",
+    section("URLs / IDs", extracted.urlsIds, protectedMax),
+  ];
+
+  if (!isLosslessFacts) {
+    parts.push("", section("Other Important Context", extracted.otherImportant, maxOther));
+  }
+
+  if (warnings.length > 0) {
+    parts.push("", "## Fidelity Warnings", bulletize(warnings));
+  }
+
+  parts.push(
+    "",
+    "## Use Guidance",
     "• Use this compact context instead of the raw source unless exact wording is required.",
-    "• Preserve IDs, dates, owners, decisions, risks, blockers, and links exactly when drafting from this context.",
-  ].join("\n");
+    "• Verify protected facts against the source before making final decisions.",
+    "• Prefer a lower compression ratio over dropping owners, dates, decisions, risks, blockers, action items, IDs, or links.",
+  );
+
+  let output = parts.join("\n");
+
+  if (estimateTokens(output) <= targetTokens || isLosslessFacts) {
+    return output;
+  }
+
+  const reduced = [
+    "Compressed context:",
+    "",
+    section("Summary", extracted.summary, maxSummary),
+    "",
+    section("Decisions", extracted.decisions, protectedMax),
+    "",
+    section("Owners", extracted.owners, protectedMax),
+    "",
+    section("Dates / Milestones", extracted.datesMilestones, protectedMax),
+    "",
+    section("Blockers", extracted.blockers, protectedMax),
+    "",
+    section("Risks", extracted.risks, protectedMax),
+    "",
+    section("Dependencies", extracted.dependencies, protectedMax),
+    "",
+    section("Requirements / Success Criteria", extracted.requirements, protectedMax),
+    "",
+    section("Action Items", extracted.actionItems, protectedMax),
+    "",
+    section("Open Questions", extracted.openQuestions, protectedMax),
+    "",
+    section("URLs / IDs", extracted.urlsIds, protectedMax),
+  ];
+
+  if (warnings.length > 0) {
+    reduced.push("", "## Fidelity Warnings", bulletize(warnings));
+  }
+
+  reduced.push(
+    "",
+    "## Compression Note",
+    `• Output exceeded the requested target of ${targetTokens} tokens, so narrative context was removed before protected facts.`,
+  );
+
+  output = reduced.join("\n");
+  return output;
+}
+
+function compressText(rawText: string, targetTokens = 1200, mode: CompressionMode = "structured"): string {
+  return buildStructuredOutput(rawText, targetTokens, mode);
 }
 
 function recordToText(record: ContextRecord): string {
@@ -159,23 +430,30 @@ function recordToText(record: ContextRecord): string {
   ].join("\n");
 }
 
+const compressionModeSchema = z
+  .enum(["brief", "balanced", "structured", "lossless_facts"])
+  .default("structured")
+  .describe("Compression mode. structured preserves project-management fields by default. lossless_facts preserves extracted facts even if reduction is lower.");
+
 server.tool(
   {
     name: "compress_context",
     description:
-      "Compress long pasted text into a dense summary without saving it. Use for meeting notes, transcripts, project docs, research, or repeated context. Preserves decisions, owners, dates, risks, blockers, IDs, links, and next actions.",
+      "Compress long pasted text into a structured summary without saving it. Use for meeting notes, transcripts, project docs, research, or repeated context. Preserves decisions, owners, dates, risks, blockers, dependencies, requirements, action items, open questions, IDs, and links.",
     schema: z.object({
       text: z.string().min(1).describe("Raw text to compress."),
       targetTokens: z.number().int().min(100).max(4000).default(1200).describe("Approximate target token budget for the compressed output."),
+      mode: compressionModeSchema,
     }),
   },
-  async ({ text: rawText, targetTokens }) => {
-    const compressed = compressText(rawText, targetTokens);
+  async ({ text: rawText, targetTokens, mode }) => {
+    const compressed = compressText(rawText, targetTokens, mode);
     const rawEstimate = estimateTokens(rawText);
     const compressedEstimate = estimateTokens(compressed);
     const reduction = rawEstimate === 0 ? 0 : 1 - compressedEstimate / rawEstimate;
 
     return text([
+      `Mode: ${mode}`,
       `Raw token estimate: ${rawEstimate}`,
       `Compressed token estimate: ${compressedEstimate}`,
       `Estimated reduction: ${Math.max(0, Math.round(reduction * 100))}%`,
@@ -195,11 +473,12 @@ server.tool(
       text: z.string().min(1).describe("Raw context text to save and compress."),
       tags: z.array(z.string()).default([]).describe("Optional tags for retrieval."),
       targetTokens: z.number().int().min(100).max(4000).default(1200).describe("Approximate target token budget for the compressed summary."),
+      mode: compressionModeSchema,
     }),
   },
-  async ({ title, text: rawText, tags, targetTokens }) => {
+  async ({ title, text: rawText, tags, targetTokens, mode }) => {
     const id = makeId();
-    const compressedText = compressText(rawText, targetTokens);
+    const compressedText = compressText(rawText, targetTokens, mode);
     const rawTokenEstimate = estimateTokens(rawText);
     const compressedTokenEstimate = estimateTokens(compressedText);
     const compressionRatio = rawTokenEstimate === 0 ? 0 : Math.max(0, 1 - compressedTokenEstimate / rawTokenEstimate);
