@@ -1,0 +1,24 @@
+{
+  "name": "token-compressor-mcp",
+  "version": "0.2.0",
+  "description": "Remote MCP server for Claude/Cowork that compresses, saves, retrieves, and deletes compact context records.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "deploy": "mcp-use deploy"
+  },
+  "dependencies": {
+    "mcp-use": "latest",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
